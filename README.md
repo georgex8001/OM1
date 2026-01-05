@@ -1,3 +1,9 @@
+<p align="center">
+<a href="README.md">English</a> | 
+<a href="README.zh.md">中文</a> | 
+<a href="README.vi.md">Tiếng Việt</a>
+</p>
+
 ![OM_Banner_X2 (1)](https://github.com/user-attachments/assets/853153b7-351a-433d-9e1a-d257b781f93c)
 
 <p align="center">
