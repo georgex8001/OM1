@@ -28,7 +28,7 @@ def simple_paths_processor(
     control_queue : mp.Queue
         Queue for sending control commands.
     """
-    setup_logging("rplidar_processor", logging_config=logging_config)
+    setup_logging("simple_paths_processor", logging_config=logging_config)
 
     def paths_callback(msg: zenoh.Sample):
         """
@@ -80,9 +80,73 @@ def simple_paths_processor(
 class SimplePathsProvider:
     """
     Singleton class to provide simple path processing using Zenoh.
+
+    This provider manages robot navigation path data by subscribing to Zenoh
+    topics and processing path information to generate movement options.
+    It uses a multiprocessing architecture with separate processes for data
+    collection and path derivation.
+
+    The provider categorizes paths into movement options:
+    - Turn left: paths with indices 0-2
+    - Advance: paths with indices 3-5
+    - Turn right: paths with indices 6-8
+    - Retreat: path with index 9
+
+    Attributes
+    ----------
+    session : Optional[zenoh.Session]
+        Zenoh session instance (currently unused, reserved for future use).
+    paths : Optional[sensor_msgs.Paths]
+        Current paths data from Zenoh subscription.
+    turn_left : List[int]
+        List of path indices representing left turn options.
+    turn_right : List[int]
+        List of path indices representing right turn options.
+    advance : List[int]
+        List of path indices representing forward movement options.
+    retreat : bool
+        Boolean flag indicating if backward movement is available.
+    path_angles : List[int]
+        Predefined angles in degrees for each path option.
+    data_queue : mp.Queue
+        Multiprocessing queue for receiving paths data from Zenoh subscriber.
+    control_queue : mp.Queue
+        Multiprocessing queue for sending control commands to processor.
+    _valid_paths : Optional[sensor_msgs.Paths]
+        Internal storage for the most recent valid paths data.
+    _lidar_string : str
+        Natural language description of available movement options.
+    _simple_paths_processor_thread : Optional[mp.Process]
+        Background process for Zenoh subscription and data collection.
+    _simple_paths_derived_thread : Optional[threading.Thread]
+        Background thread for processing paths data and generating movement options.
+    _stop_event : threading.Event
+        Event flag for signaling thread termination.
+
+    Notes
+    -----
+    The provider uses a singleton pattern to ensure only one instance exists
+    across the application. Initialization does not start background processes;
+    call `start()` method to begin data collection and processing.
     """
 
     def __init__(self):
+        """
+        Initialize the SimplePathsProvider instance.
+
+        Sets up all internal data structures, queues, and control mechanisms
+        required for path processing. Does not start background processes;
+        call `start()` method to begin operation.
+
+        Notes
+        -----
+        - Initializes empty lists for movement options (turn_left, turn_right, advance)
+        - Sets retreat flag to False
+        - Creates multiprocessing queues with maxsize=5 for data_queue
+        - Initializes thread control variables (threads set to None, stop_event created)
+        - Path angles are predefined as [-60, -45, -30, -15, 0, 15, 30, 45, 60, 180]
+        - Session and paths attributes are initialized to None
+        """
         self.session = None
         self.paths = None
 
@@ -159,12 +223,44 @@ class SimplePathsProvider:
             try:
                 paths = self.data_queue.get_nowait()
 
+                # Validate paths data structure
+                if paths is None:
+                    logging.warning("Received None paths data, skipping processing")
+                    continue
+
+                if not hasattr(paths, 'paths'):
+                    logging.warning("Paths object missing 'paths' attribute, skipping processing")
+                    continue
+
+                if not isinstance(paths.paths, list):
+                    logging.warning(f"Paths.paths is not a list (got {type(paths.paths)}), skipping processing")
+                    continue
+
+                if len(paths.paths) == 0:
+                    logging.debug("Received empty paths list, resetting movement options")
+                    self.turn_left = []
+                    self.turn_right = []
+                    self.advance = []
+                    self.retreat = False
+                    self._valid_paths = paths
+                    self._lidar_string = self._generate_movement_string([])
+                    continue
+
                 self.turn_left = []
                 self.turn_right = []
                 self.advance = []
                 self.retreat = False
 
                 for path in paths.paths:
+                    # Validate path index range (0-9)
+                    if not isinstance(path, int):
+                        logging.warning(f"Invalid path type: {type(path)}, expected int, skipping")
+                        continue
+
+                    if path < 0 or path > 9:
+                        logging.warning(f"Path index {path} out of valid range [0-9], skipping")
+                        continue
+
                     if path < 3:
                         self.turn_left.append(path)
                     elif path >= 3 and path <= 5:
@@ -175,26 +271,35 @@ class SimplePathsProvider:
                         self.retreat = True
 
                 self._valid_paths = paths
-                self._lidar_string = self._generate_movement_string(paths)
+                self._lidar_string = self._generate_movement_string(paths.paths)
 
             except Empty:
                 time.sleep(0.1)
                 continue
+            except Exception as e:
+                logging.error(f"Unexpected error in path processing: {e}", exc_info=True)
+                time.sleep(0.1)
+                continue
 
-    def _generate_movement_string(self, valid_paths: list) -> str:
+    def _generate_movement_string(self, valid_paths: List[int]) -> str:
         """
         Generate movement direction string based on valid paths.
 
         Parameters
         ----------
-        valid_paths : list
-            A list of valid paths represented as integers.
-            Each integer corresponds to a specific movement direction.
+        valid_paths : List[int]
+            A list of valid path indices represented as integers (0-9).
+            Each integer corresponds to a specific movement direction:
+            - 0-2: Turn left options
+            - 3-5: Advance (forward) options
+            - 6-8: Turn right options
+            - 9: Retreat (backward) option
 
         Returns
         -------
         str
             A string describing the safe movement directions based on the valid paths.
+            Returns a warning message if no valid paths are available.
         """
         if not valid_paths:
             return "You are surrounded by objects and cannot safely move in any direction. DO NOT MOVE."
