@@ -80,11 +80,11 @@ class ASRProvider:
         enable_tts_interrupt : bool
             If True, enables TTS interrupt.
         """
-        # 线程安全锁：保护运行状态和回调注册
+        # Thread-safe lock: protects running state and callback registration
         self._lock = threading.Lock()
         self.running: bool = False
         
-        # WebSocket 客户端配置
+        # WebSocket client configuration
         self.ws_url = ws_url
         self.stream_url = stream_url
         self.ws_client: ws.Client = ws.Client(url=ws_url)
@@ -92,12 +92,12 @@ class ASRProvider:
             ws.Client(url=stream_url) if stream_url else None
         )
         
-        # 重连机制配置
+        # Reconnection mechanism configuration
         self._reconnect_enabled = True
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
-        self._base_reconnect_delay = 1.0  # 初始重连延迟（秒）
-        self._max_reconnect_delay = 60.0  # 最大重连延迟（秒）
+        self._base_reconnect_delay = 1.0  # Initial reconnection delay in seconds
+        self._max_reconnect_delay = 60.0  # Maximum reconnection delay in seconds
         self._reconnect_thread: Optional[threading.Thread] = None
         self._stop_reconnect = threading.Event()
         
@@ -157,7 +157,7 @@ class ASRProvider:
             self._stop_reconnect.clear()
             self._reconnect_attempts = 0
 
-        # 在锁外执行启动操作，避免长时间持有锁
+        # Execute startup operations outside the lock to avoid holding it for too long
         try:
             self.ws_client.start()
             self.audio_stream.start()
@@ -173,7 +173,7 @@ class ASRProvider:
                         self.audio_stream.fill_buffer_remote
                     )
 
-            # 启动重连监控线程
+            # Start reconnection monitor thread
             if self._reconnect_enabled:
                 self._start_reconnect_monitor()
 
@@ -206,9 +206,9 @@ class ASRProvider:
             self.running = False
             self._stop_reconnect.set()
 
-        # 在锁外执行停止操作，避免长时间持有锁
+        # Execute stop operations outside the lock to avoid holding it for too long
         try:
-            # 停止重连监控线程
+            # Stop reconnection monitor thread
             if self._reconnect_thread and self._reconnect_thread.is_alive():
                 self._stop_reconnect.set()
                 self._reconnect_thread.join(timeout=2.0)
@@ -227,10 +227,12 @@ class ASRProvider:
 
     def _start_reconnect_monitor(self):
         """
-        启动 WebSocket 重连监控线程。
+        Start the WebSocket reconnection monitor thread.
 
-        该线程定期检查 WebSocket 连接状态，在连接断开时执行指数退避重连。
-        重连延迟从 base_reconnect_delay 开始，每次失败后翻倍，最大不超过 max_reconnect_delay。
+        This thread periodically checks the WebSocket connection status and performs
+        exponential backoff reconnection when the connection is lost. The reconnection
+        delay starts from base_reconnect_delay, doubles after each failure, and is
+        capped at max_reconnect_delay.
         """
         if self._reconnect_thread and self._reconnect_thread.is_alive():
             logging.warning("Reconnect monitor thread is already running")
@@ -244,21 +246,22 @@ class ASRProvider:
 
     def _reconnect_monitor_loop(self):
         """
-        重连监控循环：检查连接状态并执行指数退避重连。
+        Reconnection monitor loop: check connection status and perform exponential backoff reconnection.
 
-        该循环在后台线程中运行，定期检查 WebSocket 连接状态。如果检测到连接断开，
-        将执行指数退避重连策略，确保在网络波动时能够自动恢复连接。
+        This loop runs in a background thread and periodically checks the WebSocket connection
+        status. If a disconnection is detected, it will execute an exponential backoff reconnection
+        strategy to ensure automatic recovery from network fluctuations.
         """
         logging.info("Entering reconnection monitor loop")
-        check_interval = 5.0  # 每5秒检查一次连接状态
+        check_interval = 5.0  # Check connection status every 5 seconds
 
         while not self._stop_reconnect.is_set():
             try:
-                # 检查是否需要重连
+                # Check if reconnection is needed
                 if self._should_reconnect():
                     self._attempt_reconnect()
 
-                # 等待检查间隔或停止信号
+                # Wait for check interval or stop signal
                 if self._stop_reconnect.wait(timeout=check_interval):
                     break
 
@@ -272,20 +275,21 @@ class ASRProvider:
 
     def _should_reconnect(self) -> bool:
         """
-        判断是否需要执行重连。
+        Determine if reconnection should be performed.
 
-        检查当前运行状态和 WebSocket 客户端连接状态，确定是否需要重连。
+        Checks the current running state and WebSocket client connection status to
+        determine if reconnection is needed.
 
         Returns
         -------
         bool
-            如果需要重连返回 True，否则返回 False。
+            True if reconnection is needed, False otherwise.
         """
         with self._lock:
             if not self.running:
                 return False
 
-            # 检查重连尝试次数是否超过限制
+            # Check if reconnection attempt count exceeds the limit
             if self._reconnect_attempts >= self._max_reconnect_attempts:
                 logging.error(
                     f"Maximum reconnection attempts ({self._max_reconnect_attempts}) reached. "
@@ -293,28 +297,32 @@ class ASRProvider:
                 )
                 return False
 
-        # 检查 WebSocket 连接状态（需要在锁外检查，避免死锁）
-        # 注意：这里假设 ws.Client 有某种方式检查连接状态
-        # 如果 ws.Client 没有提供状态检查方法，可以尝试发送心跳或捕获异常
+        # Check WebSocket connection status (must be done outside lock to avoid deadlock)
+        # Note: This assumes ws.Client has some way to check connection status
+        # If ws.Client does not provide a status check method, consider sending a heartbeat
+        # or catching exceptions
         try:
-            # 如果 ws_client 有 is_connected 或类似方法，可以在这里检查
-            # 否则，重连逻辑将在实际发送消息失败时触发
-            return False  # 暂时返回 False，实际实现需要根据 ws.Client 的 API 调整
+            # If ws_client has is_connected or similar method, check it here
+            # Otherwise, reconnection logic will be triggered when message sending fails
+            return False  # Temporarily return False; actual implementation needs to be
+            # adjusted based on ws.Client API
         except Exception:
             return True
 
     def _attempt_reconnect(self):
         """
-        执行 WebSocket 重连尝试，使用指数退避策略。
+        Perform WebSocket reconnection attempt using exponential backoff strategy.
 
-        计算当前重连延迟（指数退避），停止现有连接，等待延迟时间后重新启动连接。
-        如果重连成功，重置重连计数器；如果失败，增加重连尝试次数。
+        Calculates the current reconnection delay (exponential backoff), stops the existing
+        connection, waits for the delay period, and then restarts the connection. If reconnection
+        succeeds, the reconnection counter is reset; if it fails, the reconnection attempt count
+        is incremented.
         """
         with self._lock:
             if not self.running:
                 return
 
-            # 计算指数退避延迟
+            # Calculate exponential backoff delay
             delay = min(
                 self._base_reconnect_delay * (2 ** self._reconnect_attempts),
                 self._max_reconnect_delay,
@@ -327,7 +335,7 @@ class ASRProvider:
         )
 
         try:
-            # 停止现有连接
+            # Stop existing connections
             try:
                 self.ws_client.stop()
                 if self.stream_ws_client:
@@ -335,25 +343,25 @@ class ASRProvider:
             except Exception as e:
                 logging.warning(f"Error stopping WebSocket clients during reconnect: {e}")
 
-            # 等待指数退避延迟
+            # Wait for exponential backoff delay
             time.sleep(delay)
 
-            # 重新创建并启动连接
+            # Recreate and start connections
             with self._lock:
                 if not self.running:
                     return
 
-                # 重新创建 WebSocket 客户端
+                # Recreate WebSocket clients
                 self.ws_client = ws.Client(url=self.ws_url)
                 if self.stream_url:
                     self.stream_ws_client = ws.Client(url=self.stream_url)
 
-                # 重新注册音频数据回调
+                # Re-register audio data callback
                 self.audio_stream.register_audio_data_callback(
                     self.ws_client.send_message
                 )
 
-            # 启动连接
+            # Start connections
             self.ws_client.start()
             if self.stream_ws_client:
                 self.stream_ws_client.start()
@@ -362,7 +370,7 @@ class ASRProvider:
                         self.audio_stream.fill_buffer_remote
                     )
 
-            # 重连成功，重置计数器
+            # Reconnection successful, reset counter
             with self._lock:
                 self._reconnect_attempts = 0
 
