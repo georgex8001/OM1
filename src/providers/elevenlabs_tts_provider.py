@@ -1,9 +1,12 @@
 import logging
+import threading
 from typing import Callable, Optional, Union
 
 from om1_speech import AudioOutputStream
 
 from .singleton import singleton
+
+logger = logging.getLogger(__name__)
 
 
 @singleton
@@ -16,16 +19,27 @@ class ElevenLabsTTSProvider:
 
     Parameters
     ----------
-    url : str
-        The URL endpoint for the TTS service. (Default is https://api.openmind.org/api/core/elevenlabs/tts)
-    api_key : str
-        The API key for the TTS service
+    url : str, optional
+        The URL endpoint for the TTS service.
+        Defaults to "https://api.openmind.org/api/core/elevenlabs/tts".
+    api_key : str, optional
+        The API key for the TTS service. If provided, it is sent via request headers.
+        Defaults to None.
+    elevenlabs_api_key : str, optional
+        An alternative ElevenLabs-specific API key. If provided, it is included in
+        the request payload. Defaults to None.
     voice_id : str, optional
-        The name of the voice for Eleven Labs TTS service (default is JBFqnCBsd6RMkjVDRZzb)
+        The voice identifier to use for synthesis.
+        Defaults to "JBFqnCBsd6RMkjVDRZzb".
     model_id : str, optional
-        The name of the model for Eleven Labs TTS service (default is eleven_multilingual
+        The model identifier to use for synthesis.
+        Defaults to "eleven_flash_v2_5".
     output_format : str, optional
-        The output format for the audio stream (default is mp3_44100_128)
+        The output format for the audio stream.
+        Defaults to "mp3_44100_128".
+    enable_tts_interrupt : bool, optional
+        If True, enables the ability to interrupt ongoing TTS playback when ASR detects
+        new speech input. Defaults to False.
     """
 
     def __init__(
@@ -69,6 +83,7 @@ class ElevenLabsTTSProvider:
             If True, enables the ability to interrupt ongoing TTS playback when ASR
             detects new speech input. Defaults to False.
         """
+        self._lock = threading.RLock()
         self.api_key = api_key
         self.elevenlabs_api_key = elevenlabs_api_key
         self._enable_tts_interrupt = enable_tts_interrupt
@@ -101,48 +116,62 @@ class ElevenLabsTTSProvider:
 
         Parameters
         ----------
-        url : str
+        url : str, optional
             The URL endpoint for the TTS service.
-        api_key : str
-            The API key for the TTS service.
+            Defaults to "https://api.openmind.org/api/core/elevenlabs/tts".
+        api_key : str, optional
+            The API key for the TTS service. If provided, it is sent via request headers.
+            Defaults to None.
+        elevenlabs_api_key : str, optional
+            An alternative ElevenLabs-specific API key. If provided, it is included in
+            the request payload. Defaults to None.
         voice_id : str, optional
-            The name of the voice for Eleven Labs TTS service.
+            The voice identifier to use for synthesis.
         model_id : str, optional
-            The name of the model for Eleven Labs TTS service.
+            The model identifier to use for synthesis.
         output_format : str, optional
             The output format for the audio stream.
-        enable_tts_interrupt : bool
+        enable_tts_interrupt : bool, optional
             If True, enables TTS interrupt when ASR detects speech.
+            Defaults to False.
         """
-        restart_needed = (
-            url != self._audio_stream._url
-            or api_key != self.api_key
-            or elevenlabs_api_key != self.elevenlabs_api_key
-            or voice_id != self._voice_id
-            or model_id != self._model_id
-            or output_format != self._output_format
-            or enable_tts_interrupt != self._enable_tts_interrupt
-        )
+        with self._lock:
+            restart_needed = (
+                url != self._audio_stream._url
+                or api_key != self.api_key
+                or elevenlabs_api_key != self.elevenlabs_api_key
+                or voice_id != self._voice_id
+                or model_id != self._model_id
+                or output_format != self._output_format
+                or enable_tts_interrupt != self._enable_tts_interrupt
+            )
 
-        if not restart_needed:
-            return
+            if not restart_needed:
+                return
 
-        if self.running:
+            was_running = self.running
+
+            self.api_key = api_key
+            self.elevenlabs_api_key = elevenlabs_api_key
+            self._voice_id = voice_id
+            self._model_id = model_id
+            self._output_format = output_format
+            self._enable_tts_interrupt = enable_tts_interrupt
+
+            new_stream: AudioOutputStream = AudioOutputStream(
+                url=url,
+                headers={"x-api-key": api_key} if api_key else None,
+                enable_tts_interrupt=enable_tts_interrupt,
+            )
+
+        if was_running:
             self.stop()
 
-        self.api_key = api_key
-        self.elevenlabs_api_key = elevenlabs_api_key
-        self._voice_id = voice_id
-        self._model_id = model_id
-        self._output_format = output_format
-        self._enable_tts_interrupt = enable_tts_interrupt
+        with self._lock:
+            self._audio_stream = new_stream
 
-        self._audio_stream: AudioOutputStream = AudioOutputStream(
-            url=url,
-            headers={"x-api-key": api_key} if api_key else None,
-            enable_tts_interrupt=enable_tts_interrupt,
-        )
-        self._audio_stream.start()
+        if was_running:
+            self.start()
 
     def register_tts_state_callback(self, tts_state_callback: Optional[Callable]):
         """
@@ -153,8 +182,13 @@ class ElevenLabsTTSProvider:
         tts_state_callback : Optional[Callable]
             The callback function to receive TTS state changes.
         """
-        if tts_state_callback is not None:
-            self._audio_stream.set_tts_state_callback(tts_state_callback)
+        if tts_state_callback is None:
+            return
+
+        with self._lock:
+            stream = self._audio_stream
+
+        stream.set_tts_state_callback(tts_state_callback)
 
     def create_pending_message(self, text: str) -> dict:
         """
@@ -170,17 +204,24 @@ class ElevenLabsTTSProvider:
         dict
             A dictionary containing the TTS request parameters.
         """
-        logging.info(f"audio_stream: {text}")
-        elevenlabs_api_key = (
-            {"elevenlabs_api_key": self.elevenlabs_api_key}
-            if self.elevenlabs_api_key
-            else {}
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("tts enqueue: text_len=%d", len(text))
+
+        with self._lock:
+            elevenlabs_api_key = (
+                {"elevenlabs_api_key": self.elevenlabs_api_key}
+                if self.elevenlabs_api_key
+                else {}
+            )
+            voice_id = self._voice_id
+            model_id = self._model_id
+            output_format = self._output_format
+
         return {
             "text": text,
-            "voice_id": self._voice_id,
-            "model_id": self._model_id,
-            "output_format": self._output_format,
+            "voice_id": voice_id,
+            "model_id": model_id,
+            "output_format": output_format,
             **elevenlabs_api_key,
         }
 
@@ -193,15 +234,21 @@ class ElevenLabsTTSProvider:
         message : Union[str, dict]
             The message to be added, typically containing text and TTS parameters.
         """
-        if not self.running:
-            logging.warning(
-                "TTS provider is not running. Call start() before adding messages."
-            )
+        with self._lock:
+            running = self.running
+            stream = self._audio_stream
+
+        if not running:
+            logger.warning("TTS provider is not running. Call start() before adding messages.")
             return
 
-        if isinstance(message, str):
-            message = self.create_pending_message(message)
-        self._audio_stream.add_request(message)
+        try:
+            if isinstance(message, str):
+                message = self.create_pending_message(message)
+            stream.add_request(message)
+        except Exception:
+            logger.error("Failed to enqueue TTS request.", exc_info=True)
+            raise
 
     def get_pending_message_count(self) -> int:
         """
@@ -212,26 +259,35 @@ class ElevenLabsTTSProvider:
         int
             The number of pending messages.
         """
-        return self._audio_stream._pending_requests.qsize()
+        with self._lock:
+            stream = self._audio_stream
+
+        return stream._pending_requests.qsize()
 
     def start(self):
         """
         Start the TTS provider and its audio stream.
         """
-        if self.running:
-            logging.warning("Eleven Labs TTS provider is already running")
-            return
+        with self._lock:
+            if self.running:
+                logger.warning("Eleven Labs TTS provider is already running")
+                return
 
-        self.running = True
-        self._audio_stream.start()
+            self.running = True
+            stream = self._audio_stream
+
+        stream.start()
 
     def stop(self):
         """
         Stop the TTS provider and cleanup resources.
         """
-        if not self.running:
-            logging.warning("Eleven Labs TTS provider is not running")
-            return
+        with self._lock:
+            if not self.running:
+                logger.warning("Eleven Labs TTS provider is not running")
+                return
 
-        self.running = False
-        self._audio_stream.stop()
+            self.running = False
+            stream = self._audio_stream
+
+        stream.stop()
